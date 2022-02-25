@@ -1,4 +1,5 @@
 # CudaBenchmark
 
-nvcc matrixMul2.cu 
+nvcc matrixMul2.cu
+
 ./a.out
