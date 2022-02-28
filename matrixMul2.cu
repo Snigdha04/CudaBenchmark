@@ -1,9 +1,29 @@
 // System includes
 #include <stdio.h>
 #include <assert.h>
+#include <vector>
+#include <iostream>       // std::cout, std::endl
+#include <thread>         // std::this_thread::sleep_for
+#include <chrono>
+#include <fstream>
 
 // CUDA runtime
 #include <cuda_runtime.h>
+
+#define QPS 12
+
+struct profileTime {
+    int idx;
+    cudaEvent_t start;
+    cudaEvent_t stop;
+    float elapsedTime;
+};
+
+std::vector<profileTime> timeVec(QPS); 
+std::ofstream outfile;
+std::vector<std::chrono::high_resolution_clock::time_point> record_start = std::vector<std::chrono::high_resolution_clock::time_point>(QPS);
+std::vector<std::chrono::high_resolution_clock::time_point> record_end = std::vector<std::chrono::high_resolution_clock::time_point>(QPS);
+std::vector<std::chrono::high_resolution_clock::time_point> record_sent = std::vector<std::chrono::high_resolution_clock::time_point>(QPS);
 
 void constantInit(float *data, int size, float val)
 {
@@ -43,6 +63,35 @@ void matrixMulCUDA(float *C, float *A, float *B, unsigned int w) {
     layerMul(A, B, C, w);
     layerMul(B, C, A, w);
     
+}
+
+void checkCudaErrors(cudaError_t status) {
+    if(status != cudaSuccess) {
+        fprintf(stderr, "Failed to create start event (error code %s)!\n", cudaGetErrorString(status));
+        exit(EXIT_FAILURE);
+    }
+}
+
+void CUDART_CB myStreamCallback(cudaStream_t stream, cudaError_t status, void *data)
+{
+    // Check status of GPU after stream operations are done
+    // std::cout << "Callback \n";
+    checkCudaErrors(status);
+    int* idx = (int*)data;
+    // std::cout << *idx << " : idx \n";
+    // timeVec
+    // checkCudaErrors( cudaEventCreate(&timeVec[*idx].stop) );
+    // checkCudaErrors( cudaEventElapsedTime(&timeVec[*idx].elapsedTime, timeVec[*idx].start, timeVec[*idx].stop) );
+
+    auto stop = std::chrono::high_resolution_clock::now();
+
+    auto request_time = std::chrono::duration_cast<std::chrono::microseconds>(stop - record_start[*idx]);
+    outfile << request_time.count() << std::endl;
+
+    // std::cout << request_time.count() << std::endl;
+
+    // std::cout << timeVec[*idx].elapsedTime << " : elapsed time \n";
+
 }
 
 int matrixMultiply(dim3 &dimsA, dim3 &dimsB){
@@ -106,11 +155,21 @@ int matrixMultiply(dim3 &dimsA, dim3 &dimsB){
     }
 
     // Execute the kernel
-    int nIter = 10100;
+    int nIter = QPS;
+    int sleep_duration = 1000/QPS; // dutarion in millisec
+    cudaStream_t stream;
+    checkCudaErrors(cudaStreamCreate(&stream));
 
-    for (int j = 0; j < nIter; j++)
-    {
-        matrixMulCUDA<<<1,1>>>(h_C, h_A, h_B, dimsA.x);
+    for (int j = 0; j < QPS; j++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(sleep_duration));
+        timeVec[j].idx = j;
+        // checkCudaErrors( cudaEventCreate(&timeVec[j].start) );
+        auto start = std::chrono::high_resolution_clock::now();
+        record_start[j] = start;
+        matrixMulCUDA<<<1,1,0, stream>>>(h_C, h_A, h_B, dimsA.x);
+        checkCudaErrors( cudaStreamAddCallback(stream, myStreamCallback, &timeVec[j].idx, 0) );
+
+        // std::cout << "cuda matmul added callback" << j << " \n";
     }
 
     // Record the stop event
@@ -169,6 +228,7 @@ int main() {
     cudaError_t error;
     cudaDeviceProp deviceProp;
     error = cudaGetDevice(&devID);
+    outfile.open("profile_ouput_" + std::to_string(QPS) + ".txt", std::fstream::out);
 
     if (error != cudaSuccess)
     {
@@ -209,5 +269,7 @@ int main() {
     int matrix_result = matrixMultiply(dimsA, dimsB);
 
     exit(matrix_result);
+    outfile.close();
+
     return 0;
 }
