@@ -6,11 +6,12 @@
 #include <thread>         // std::this_thread::sleep_for
 #include <chrono>
 #include <fstream>
+#include <torch/torch.h>
 
 // CUDA runtime
 #include <cuda_runtime.h>
 
-#define QPS 12
+#define QPS 990
 
 struct profileTime {
     int idx;
@@ -25,10 +26,8 @@ std::vector<std::chrono::high_resolution_clock::time_point> record_start = std::
 std::vector<std::chrono::high_resolution_clock::time_point> record_end = std::vector<std::chrono::high_resolution_clock::time_point>(QPS);
 std::vector<std::chrono::high_resolution_clock::time_point> record_sent = std::vector<std::chrono::high_resolution_clock::time_point>(QPS);
 
-void constantInit(float *data, int size, float val)
-{
-    for (int i = 0; i < size; ++i)
-    {
+void constantInit(float *data, int size, float val) {
+    for (int i = 0; i < size; ++i) {
         data[i] = val;
     }
 }
@@ -44,24 +43,100 @@ void layerMul(float *C, float *A, float *B, unsigned int w) {
     }
 }
 
-__global__ 
-void matrixMulCUDA(float *C, float *A, float *B, unsigned int w) {
+template <int BLOCK_SIZE> __device__ 
+void layerMulTile(float *C, float *A, float *B, int wA, int wB)
+{
+    // Block index
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
 
-    layerMul(C, A, B, w);
-    layerMul(A, B, C, w);
-    layerMul(B, C, A, w);
+    // Thread index
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
 
-    layerMul(C, A, B, w);
-    layerMul(A, B, C, w);
-    layerMul(B, C, A, w);
+    // Index of the first sub-matrix of A processed by the block
+    int aBegin = wA * BLOCK_SIZE * by;
 
-    layerMul(C, A, B, w);
-    layerMul(A, B, C, w);
-    layerMul(B, C, A, w);
+    // Index of the last sub-matrix of A processed by the block
+    int aEnd   = aBegin + wA - 1;
 
-    layerMul(C, A, B, w);
-    layerMul(A, B, C, w);
-    layerMul(B, C, A, w);
+    // Step size used to iterate through the sub-matrices of A
+    int aStep  = BLOCK_SIZE;
+
+    // Index of the first sub-matrix of B processed by the block
+    int bBegin = BLOCK_SIZE * bx;
+
+    // Step size used to iterate through the sub-matrices of B
+    int bStep  = BLOCK_SIZE * wB;
+
+    // Csub is used to store the element of the block sub-matrix
+    // that is computed by the thread
+    float Csub = 0;
+
+    // Loop over all the sub-matrices of A and B
+    // required to compute the block sub-matrix
+    for (int a = aBegin, b = bBegin;
+         a <= aEnd;
+         a += aStep, b += bStep)
+    {
+
+        // Declaration of the shared memory array As used to
+        // store the sub-matrix of A
+        __shared__ float As[BLOCK_SIZE][BLOCK_SIZE];
+
+        // Declaration of the shared memory array Bs used to
+        // store the sub-matrix of B
+        __shared__ float Bs[BLOCK_SIZE][BLOCK_SIZE];
+
+        // Load the matrices from device memory
+        // to shared memory; each thread loads
+        // one element of each matrix
+        As[ty][tx] = A[a + wA * ty + tx];
+        Bs[ty][tx] = B[b + wB * ty + tx];
+
+        // Synchronize to make sure the matrices are loaded
+        __syncthreads();
+
+        // Multiply the two matrices together;
+        // each thread computes one element
+        // of the block sub-matrix
+#pragma unroll
+
+        for (int k = 0; k < BLOCK_SIZE; ++k)
+        {
+            Csub += As[ty][k] * Bs[k][tx];
+        }
+
+        // Synchronize to make sure that the preceding
+        // computation is done before loading two new
+        // sub-matrices of A and B in the next iteration
+        __syncthreads();
+    }
+
+    // Write the block sub-matrix to device memory;
+    // each thread writes one element
+    int c = wB * BLOCK_SIZE * by + BLOCK_SIZE * bx;
+    C[c + wB * ty + tx] = Csub;
+}
+
+template <int BLOCK_SIZE> __global__ 
+void matrixMulCUDA(float *C, float *A, float *B, int wA, int wB) {
+
+    layerMulTile<BLOCK_SIZE>(C, A, B, wA, wB);
+    layerMulTile<BLOCK_SIZE>(A, B, C, wA, wB);
+    layerMulTile<BLOCK_SIZE>(B, C, A, wA, wB);
+
+    layerMulTile<BLOCK_SIZE>(C, A, B, wA, wB);
+    layerMulTile<BLOCK_SIZE>(A, B, C, wA, wB);
+    layerMulTile<BLOCK_SIZE>(B, C, A, wA, wB);
+
+    layerMulTile<BLOCK_SIZE>(C, A, B, wA, wB);
+    layerMulTile<BLOCK_SIZE>(A, B, C, wA, wB);
+    layerMulTile<BLOCK_SIZE>(B, C, A, wA, wB);
+
+    layerMulTile<BLOCK_SIZE>(C, A, B, wA, wB);
+    layerMulTile<BLOCK_SIZE>(A, B, C, wA, wB);
+    layerMulTile<BLOCK_SIZE>(B, C, A, wA, wB);
     
 }
 
@@ -94,7 +169,7 @@ void CUDART_CB myStreamCallback(cudaStream_t stream, cudaError_t status, void *d
 
 }
 
-int matrixMultiply(dim3 &dimsA, dim3 &dimsB){
+int matrixMultiply(dim3 &dimsA, dim3 &dimsB, int block_size){
     // Allocate host memory for matrices A and B
     unsigned int size_A = dimsA.x * dimsA.y;
     unsigned int mem_size_A = sizeof(float) * size_A;
@@ -123,8 +198,17 @@ int matrixMultiply(dim3 &dimsA, dim3 &dimsB){
     constantInit(h_B, size_B, valB);
     constantInit(h_C, size_A, 0.0f);
 
+    // Setup execution parameters
+    dim3 threads(block_size, block_size);
+    dim3 grid(dimsB.x / threads.x, dimsA.y / threads.y);
+
     // warm up
-    matrixMulCUDA<<<1,1>>>(h_C, h_A, h_B, dimsA.x);
+    for(int i=0; i<10; i++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        matrixMulCUDA<32><<< grid,threads >>>(h_C, h_A, h_B, dimsA.x, dimsB.x);
+    }
+    
+    cudaDeviceSynchronize();
 
     cudaError_t error;
     cudaEvent_t start;
@@ -166,7 +250,7 @@ int matrixMultiply(dim3 &dimsA, dim3 &dimsB){
         // checkCudaErrors( cudaEventCreate(&timeVec[j].start) );
         auto start = std::chrono::high_resolution_clock::now();
         record_start[j] = start;
-        matrixMulCUDA<<<1,1,0, stream>>>(h_C, h_A, h_B, dimsA.x);
+        matrixMulCUDA<32><<< grid,threads,0, stream >>>(h_C, h_A, h_B, dimsA.x, dimsB.x);
         checkCudaErrors( cudaStreamAddCallback(stream, myStreamCallback, &timeVec[j].idx, 0) );
 
         // std::cout << "cuda matmul added callback" << j << " \n";
@@ -252,10 +336,13 @@ int main() {
         printf("GPU Device %d: \"%s\" with compute capability %d.%d\n\n", devID, deviceProp.name, deviceProp.major, deviceProp.minor);
     }
 
-    int w = 64;
+    // int w = 64;
+    // dim3 dimsA(w, w, 1);
+    // dim3 dimsB(w, w, 1);
 
-    dim3 dimsA(w, w, 1);
-    dim3 dimsB(w, w, 1);
+    int block_size = 32;
+    dim3 dimsA(5*2*block_size, 5*2*block_size, 1);
+    dim3 dimsB(5*2*block_size, 5*2*block_size, 1);
 
     if (dimsA.x != dimsB.y)
     {
@@ -266,7 +353,7 @@ int main() {
 
     printf("MatrixA(%d,%d), MatrixB(%d,%d)\n", dimsA.x, dimsA.y, dimsB.x, dimsB.y);
 
-    int matrix_result = matrixMultiply(dimsA, dimsB);
+    int matrix_result = matrixMultiply(dimsA, dimsB, block_size);
 
     exit(matrix_result);
     outfile.close();
