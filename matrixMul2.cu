@@ -6,12 +6,12 @@
 #include <thread>         // std::this_thread::sleep_for
 #include <chrono>
 #include <fstream>
-#include <torch/torch.h>
+// #include <torch/torch.h>
 
 // CUDA runtime
 #include <cuda_runtime.h>
 
-#define QPS 990
+#define QPS 2000
 
 struct profileTime {
     int idx;
@@ -166,6 +166,155 @@ void CUDART_CB myStreamCallback(cudaStream_t stream, cudaError_t status, void *d
     // std::cout << request_time.count() << std::endl;
 
     // std::cout << timeVec[*idx].elapsedTime << " : elapsed time \n";
+
+}
+
+int matrixMultiply_include_A_memcpy(dim3 &dimsA, dim3 &dimsB, int block_size){
+
+    // Allocate host memory for matrices A, B and C
+    unsigned int image_cnt = QPS;
+    std::vector<float *> images;
+
+    unsigned int size_A = dimsA.x * dimsA.y;
+    unsigned int mem_size_A = sizeof(float) * size_A;
+    float *h_A;
+    for (int i=0; i<image_cnt; i++) {
+        h_A == NULL;
+        h_A = (float *)malloc(mem_size_A);
+        images.push_back(h_A);
+        if (h_A == NULL)
+        {
+            fprintf(stderr, "Failed to allocate matrix!\n");
+            exit(EXIT_FAILURE);
+        }
+    }
+    
+    unsigned int size_B = dimsB.x * dimsB.y;
+    unsigned int mem_size_B = sizeof(float) * size_B;
+    float *h_B = (float *)malloc(mem_size_B);
+
+    dim3 dimsC(dimsB.x, dimsA.y, 1);
+    unsigned int mem_size_C = dimsC.x * dimsC.y * sizeof(float);
+    float *h_C = (float *) malloc(mem_size_C);
+
+    if (h_B == NULL | h_C == NULL)
+    {
+        fprintf(stderr, "Failed to allocate matrix!\n");
+        exit(EXIT_FAILURE);
+    }
+
+    // Initialize host memory
+    const float valB = 0.01f;
+    for (int i=0; i<image_cnt; i++) {
+        constantInit(images[i], size_A, 1.0f);
+    }
+    // constantInit(h_A, size_A, 1.0f);
+    constantInit(h_B, size_B, valB);
+    constantInit(h_C, size_A, 0.0f);
+
+    // Allocate device memory
+    float *d_A, *d_B, *d_C;
+    checkCudaErrors( cudaMalloc((void **) &d_A, mem_size_A) );
+    checkCudaErrors( cudaMalloc((void **) &d_B, mem_size_B) );
+    checkCudaErrors( cudaMalloc((void **) &d_C, mem_size_C) );
+
+    // copy host memory to device
+    // checkCudaErrors( cudaMemcpy(d_A, h_A, mem_size_A, cudaMemcpyHostToDevice) );
+    checkCudaErrors( cudaMemcpy(d_B, h_B, mem_size_B, cudaMemcpyHostToDevice) );
+
+    // Setup execution parameters
+    dim3 threads(block_size, block_size);
+    dim3 grid(dimsB.x / threads.x, dimsA.y / threads.y);
+
+    // warm up just for matrix B - the weight matrix!
+    for(int i=0; i<10; i++) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        matrixMulCUDA<32><<< grid,threads >>>(d_C, d_B, d_B, dimsA.x, dimsB.x);
+    }
+    
+    cudaDeviceSynchronize();
+
+    cudaEvent_t start;
+    checkCudaErrors( cudaEventCreate(&start) );
+
+    cudaEvent_t stop;
+    checkCudaErrors( cudaEventCreate(&stop) );
+
+    // Record the start event
+    checkCudaErrors( cudaEventRecord(start, NULL) );
+
+    // Execute the kernel
+    int nIter = QPS;
+    int sleep_duration = (1000*1000)/QPS; // dutarion in microseconds
+    cudaStream_t stream;
+    checkCudaErrors(cudaStreamCreate(&stream));
+
+    auto start_exp = std::chrono::high_resolution_clock::now();
+
+    for (int j = 0; j < QPS; j++) {
+        std::this_thread::sleep_for(std::chrono::microseconds(sleep_duration));
+        timeVec[j].idx = j;
+        // checkCudaErrors( cudaEventCreate(&timeVec[j].start) );
+        auto start_time = std::chrono::high_resolution_clock::now();
+        record_start[j] = start_time;
+
+        checkCudaErrors( cudaMemcpyAsync(d_A, images[j], mem_size_A, cudaMemcpyHostToDevice, stream) );
+
+        matrixMulCUDA<32><<< grid,threads,0, stream >>>(d_C, d_A, d_B, dimsA.x, dimsB.x);
+
+        checkCudaErrors( cudaMemcpyAsync(h_C, d_C, mem_size_C, cudaMemcpyDeviceToHost, stream) );
+
+        checkCudaErrors( cudaStreamAddCallback(stream, myStreamCallback, &timeVec[j].idx, 0) );
+        // std::cout << "cuda matmul added callback" << j << " \n";
+    }
+
+    auto end_exp = std::chrono::high_resolution_clock::now();
+
+    auto request_exp = std::chrono::duration_cast<std::chrono::microseconds>(end_exp-start_exp);
+    std::cout << request_exp.count() << ": is the experiment duration\n";
+
+    // Record the stop event
+    checkCudaErrors( cudaEventRecord(stop, NULL) );
+
+    
+
+    // Wait for the stop event to complete
+    checkCudaErrors( cudaEventSynchronize(stop) );
+
+    float msecTotal = 0.0f;
+    checkCudaErrors( cudaEventElapsedTime(&msecTotal, start, stop) );
+
+    // float msecTotal = 0.0f;
+    // checkCudaErrors( cudaEventElapsedTime(&msecTotal, start, stop) );
+
+    // Compute and print the performance
+    float msecPerMatrixMul = msecTotal / nIter;
+    double flopsPerMatrixMul = 2.0 * (double)dimsA.x * (double)dimsA.y * (double)dimsB.x;
+    double gigaFlops = (flopsPerMatrixMul * 1.0e-9f) / (msecPerMatrixMul / 1000.0f);
+    printf(
+        "Performance= %.2f GFlop/s, Time= %.3f msec, Size= %.0f Ops\n",
+        gigaFlops,
+        msecPerMatrixMul,
+        flopsPerMatrixMul);
+
+    checkCudaErrors( cudaMemcpy(h_C, d_C, mem_size_C, cudaMemcpyDeviceToHost) );
+
+    // Clean up memory
+    free(h_A);
+    free(h_B);
+    free(h_C);
+    cudaFree(d_A);
+    cudaFree(d_B);
+    cudaFree(d_C);
+
+    // cudaDeviceReset causes the driver to clean up all state. While
+    // not mandatory in normal operation, it is good practice.  It is also
+    // needed to ensure correct operation when the application is being
+    // profiled. Calling cudaDeviceReset causes all profile data to be
+    // flushed before the application exits
+    cudaDeviceReset();
+
+    return EXIT_SUCCESS;
 
 }
 
@@ -353,7 +502,7 @@ int main() {
 
     printf("MatrixA(%d,%d), MatrixB(%d,%d)\n", dimsA.x, dimsA.y, dimsB.x, dimsB.y);
 
-    int matrix_result = matrixMultiply(dimsA, dimsB, block_size);
+    int matrix_result = matrixMultiply_include_A_memcpy(dimsA, dimsB, block_size);
 
     exit(matrix_result);
     outfile.close();
